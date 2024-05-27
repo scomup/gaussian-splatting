@@ -6,3 +6,5 @@ build
 #diff_rasterization/dist
 tensorboard_3d
 screenshots
+input.ply
+cameras.json
