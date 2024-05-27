@@ -22,6 +22,12 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
+import matplotlib.pyplot as plt
+import numpy as np
+
+fig, ax = plt.subplots()
+array = np.zeros(shape=(545, 980, 3), dtype=np.uint8)
+im = ax.imshow(array)
 
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
@@ -66,6 +72,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        viewpoint_cam.colmap_id
+
+        if (viewpoint_cam.uid == 1):
+            im_cpu = image.to('cpu').detach().permute(1, 2, 0).numpy()
+            im.set_data(im_cpu)
+            # fig.canvas.flush_events()
+            plt.pause(0.1)
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -129,7 +142,9 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    
+    #print(args)
+    #exit()
+    args.source_path='/home/liu/bag/gaussian-splatting/tandt/train'
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

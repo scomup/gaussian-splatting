@@ -171,6 +171,8 @@ class GaussianRasterizer(nn.Module):
             shs = torch.Tensor([])
         if colors_precomp is None:
             colors_precomp = torch.Tensor([])
+        if cov3D_precomp is None:
+            cov3D_precomp = torch.Tensor([])
 
         if scales is None:
             scales = torch.Tensor([])
