@@ -74,13 +74,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         viewpoint_cam.colmap_id
 
-        if (viewpoint_cam.uid == 1):
-            im_cpu = image.to('cpu').detach().permute(1, 2, 0).numpy()
-            im.set_data(im_cpu)
-            # fig.canvas.flush_events()
-            plt.pause(0.1)
-
+        # if (viewpoint_cam.uid == 1):
+        #     im_cpu = image.to('cpu').detach().permute(1, 2, 0).numpy()
+        #     im.set_data(im_cpu)
+        #     # fig.canvas.flush_events()
+        #     plt.pause(0.1)
         # Loss
+    
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -144,7 +144,7 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     #print(args)
     #exit()
-    args.source_path='/home/liu/bag/gaussian-splatting/tandt/train'
+    args.source_path='/home/liu/bag/colmap/'
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

@@ -21,6 +21,71 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
+
+def gsdata_type(sh_dim):
+    return [('pw', '<f4', (3,)),
+            ('rot', '<f4', (4,)),
+            ('scale', '<f4', (3,)),
+            ('alpha', '<f4'),
+            ('sh', '<f4', (sh_dim))]
+
+def save_torch_params(fn, rots_raw, scales_raw, shs, alphas_raw, pws):
+    # Limit the value of alphas: 0 < alphas < 1
+    alphas = torch.sigmoid(alphas_raw)
+    # Limit the value of scales > 0
+    scales = torch.exp(scales_raw)
+    # Limit the value of rot, normal of rots is 1
+    rots = torch.nn.functional.normalize(rots_raw)
+
+    rots = rots.detach().cpu().numpy()
+    scales = scales.detach().cpu().numpy()
+    shs = shs.detach().cpu().numpy()
+    alphas = alphas.detach().cpu().numpy().squeeze()
+    pws = pws.detach().cpu().numpy()
+    dtypes = gsdata_type(shs.shape[1])
+    gs = np.rec.fromarrays(
+        [pws, rots, scales, alphas, shs], dtype=dtypes)
+    np.save(fn, gs)
+
+
+
+def rainbow(scalars, scalar_min=0, scalar_max=255):
+    range = scalar_max - scalar_min
+    values = 1.0 - (scalars - scalar_min) / range
+    # values = (scalars - scalar_min) / range  # using inverted color
+    colors = torch.zeros([scalars.shape[0], 3], dtype=torch.float32, device='cuda')
+    values = torch.clip(values, 0, 1)
+
+    h = values * 5.0 + 1.0
+    i = torch.floor(h).to(torch.int32)
+    f = h - i
+    f[torch.logical_not(i % 2)] = 1 - f[torch.logical_not(i % 2)]
+    n = 1 - f
+
+    # idx = i <= 1
+    colors[i <= 1, 0] = n[i <= 1]
+    colors[i <= 1, 1] = 0
+    colors[i <= 1, 2] = 1
+
+    colors[i == 2, 0] = 0
+    colors[i == 2, 1] = n[i == 2]
+    colors[i == 2, 2] = 1
+
+    colors[i == 3, 0] = 0
+    colors[i == 3, 1] = 1
+    colors[i == 3, 2] = n[i == 3]
+
+    colors[i == 4, 0] = n[i == 4]
+    colors[i == 4, 1] = 1
+    colors[i == 4, 2] = 0
+
+    colors[i >= 5, 0] = 1
+    colors[i >= 5, 1] = n[i >= 5]
+    colors[i >= 5, 2] = 0
+    shs = (colors - 0.5) / 0.28209479177387814
+    return shs
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -371,6 +436,7 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
+
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -383,6 +449,10 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        # LIU: show grad as color
+        shs = rainbow(torch.norm(grads, dim=-1), 0, 0.0001)
+        save_torch_params("/home/liu/test.npy", self._rotation, self._scaling, shs, self._opacity, self._xyz)
+
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
 
@@ -405,3 +475,7 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+        # print("viewspace_point_tensor")
+        # print(torch.max(viewspace_point_tensor))
+        # print("xyz_gradient_accum")
+        # print(torch.max(self.xyz_gradient_accum[update_filter]))
