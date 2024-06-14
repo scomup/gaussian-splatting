@@ -24,6 +24,119 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import matplotlib.pyplot as plt
 import numpy as np
+import gsplatcu as gsc
+
+
+class Camera:
+    def __init__(self, id, width, height, fx, fy, cx, cy, Rcw, tcw):
+        self.id = id
+        self.width = width
+        self.height = height
+        self.fx = fx
+        self.fy = fy
+        self.cx = cx
+        self.cy = cy
+        self.Rcw = Rcw
+        self.tcw = tcw
+        self.twc = -torch.linalg.inv(Rcw) @ tcw
+
+
+class GSFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        pws,
+        shs,
+        alphas,
+        scales,
+        rots,
+        us,
+        cam,
+    ):
+        # more detail view forward.pdf
+        # step1. Transform pw to camera frame,
+        # and project it to iamge.
+        us, pcs, depths, du_dpcs = gsc.project(
+            pws, cam.Rcw, cam.tcw, cam.fx, cam.fy, cam.cx, cam.cy, True)
+
+        # step2. Calcuate the 3d Gaussian.
+        cov3ds, dcov3d_drots, dcov3d_dscales = gsc.computeCov3D(
+            rots, scales, depths, True)
+
+        # step3. Calcuate the 2d Gaussian.
+        cov2ds, dcov2d_dcov3ds, dcov2d_dpcs = gsc.computeCov2D(
+            cov3ds, pcs, cam.Rcw, depths, cam.fx, cam.fy, cam.width, cam.height, True)
+
+        # step4. get color info
+        colors, dcolor_dshs, dcolor_dpws = gsc.sh2Color(shs.reshape(shs.shape[0], -1), pws, cam.twc, True)
+
+        # step5. Blend the 2d Gaussian to image
+        cinv2ds, areas, dcinv2d_dcov2ds = gsc.inverseCov2D(cov2ds, depths, True)
+        image, contrib, final_tau, patch_range_per_tile, gsid_per_patch =\
+            gsc.splat(cam.height, cam.width,
+                      us, cinv2ds, alphas, depths, colors, areas)
+
+        # Store the static parameters in the context
+        ctx.cam = cam
+        # Keep relevant tensors for backward
+        ctx.save_for_backward(us, cinv2ds, alphas,
+                              depths, colors, contrib, final_tau,
+                              patch_range_per_tile, gsid_per_patch,
+                              dcinv2d_dcov2ds, dcov2d_dcov3ds,
+                              dcov3d_drots, dcov3d_dscales, dcolor_dshs,
+                              du_dpcs, dcov2d_dpcs, dcolor_dpws)
+        return image, areas
+
+    @staticmethod
+    def backward(ctx, dloss_dgammas, _):
+        # Retrieve the saved tensors and static parameters
+        cam = ctx.cam
+        us, cinv2ds, alphas, \
+            depths, colors, contrib, final_tau,\
+            patch_range_per_tile, gsid_per_patch,\
+            dcinv2d_dcov2ds, dcov2d_dcov3ds,\
+            dcov3d_drots, dcov3d_dscales, dcolor_dshs,\
+            du_dpcs, dcov2d_dpcs, dcolor_dpws = ctx.saved_tensors
+
+        # more detail view backward.pdf
+
+        # section.5
+        dloss_dus, dloss_dcinv2ds, dloss_dalphas, dloss_dcolors =\
+            gsc.splatB(cam.height, cam.width, us, cinv2ds, alphas,
+                       depths, colors, contrib, final_tau,
+                       patch_range_per_tile, gsid_per_patch, dloss_dgammas)
+
+        dpc_dpws = cam.Rcw
+        dloss_dcov2ds = dloss_dcinv2ds @ dcinv2d_dcov2ds
+        # backward.pdf equation (3)
+        dloss_drots = dloss_dcov2ds @ dcov2d_dcov3ds @ dcov3d_drots
+        # backward.pdf equation (4)
+        dloss_dscales = dloss_dcov2ds @ dcov2d_dcov3ds @ dcov3d_dscales
+        # backward.pdf equation (5)
+        dloss_dshs = (dloss_dcolors.permute(0, 2, 1) @
+                      dcolor_dshs).permute(0, 2, 1).squeeze()
+
+        # dloss_dshs = dloss_dshs.reshape(dloss_dshs.shape[0], -1)
+        # backward.pdf equation (7)
+        dloss_dpws = dloss_dus @ du_dpcs @ dpc_dpws + \
+            dloss_dcolors @ dcolor_dpws + \
+            dloss_dcov2ds @ dcov2d_dpcs @ dpc_dpws
+
+        new_dloss_dus = torch.zeros(dloss_dus.shape[0], 3).to(torch.float32).to('cuda')
+
+        # Assuming your original tensor has shape [N, 2]
+        # Copy the data from the original tensor to the new tensor
+        new_dloss_dus[:, 0] = dloss_dus[:, 0, 0] * cam.width * 0.5
+        new_dloss_dus[:, 1] = dloss_dus[:, 0, 1] * cam.height * 0.5
+
+        return dloss_dpws.squeeze(),\
+            dloss_dshs.squeeze(),\
+            dloss_dalphas.squeeze().unsqueeze(1),\
+            dloss_dscales.squeeze(),\
+            dloss_drots.squeeze(),\
+            new_dloss_dus.squeeze(),\
+            None
+
 
 fig, ax = plt.subplots()
 array = np.zeros(shape=(545, 980, 3), dtype=np.uint8)
@@ -70,17 +183,43 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-        viewpoint_cam.colmap_id
+        fx = viewpoint_cam.image_width / (2 * np.tan(viewpoint_cam.FoVx / 2))
+        fy = viewpoint_cam.image_height / (2 * np.tan(viewpoint_cam.FoVy / 2))
+        cx = viewpoint_cam.image_width / 2
+        cy = viewpoint_cam.image_height / 2
+        Rcw = torch.from_numpy(viewpoint_cam.R.transpose()).to(torch.float32).to('cuda')
+        tcw = torch.from_numpy(viewpoint_cam.T).to(torch.float32).to('cuda')
 
-        # if (viewpoint_cam.uid == 1):
-        #     im_cpu = image.to('cpu').detach().permute(1, 2, 0).numpy()
-        #     im.set_data(im_cpu)
-        #     # fig.canvas.flush_events()
-        #     plt.pause(0.1)
-        # Loss
-    
+        cam = Camera(viewpoint_cam.colmap_id, viewpoint_cam.image_width,
+                     viewpoint_cam.image_height, fx, fy, cx, cy, Rcw, tcw)
+
+        means3D = gaussians.get_xyz
+        # means2D = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device="cuda") + 0
+        viewspace_point_tensor = torch.zeros(
+            [means3D.shape[0], 3], dtype=torch.float32, device='cuda', requires_grad=True)
+
+        opacity = gaussians.get_opacity
+
+        scales = gaussians.get_scaling
+        rotations = gaussians.get_rotation
+
+        shs = gaussians.get_features
+
+        image, areas = GSFunction.apply(means3D, shs, opacity, scales, rotations, viewspace_point_tensor, cam)
+        radii = torch.norm(areas.to(torch.float32),dim=1)
+        visibility_filter = radii > 0
+        # viewspace_point_tensor = means2D
+
+        # render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        # image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg[
+        #     "viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        # viewpoint_cam.colmap_id
+
+        if (viewpoint_cam.uid == 1):
+            im_cpu = image.to('cpu').detach().permute(1, 2, 0).numpy()
+            im.set_data(im_cpu)
+            plt.pause(0.1)
+
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
@@ -144,7 +283,7 @@ if __name__ == "__main__":
     args.save_iterations.append(args.iterations)
     #print(args)
     #exit()
-    args.source_path='/home/liu/bag/colmap/'
+    args.source_path='/home/liu/bag/gaussian-splatting/tandt/train'
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
